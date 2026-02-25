@@ -308,7 +308,7 @@ class PyTorchClassifierWrapper(ArtPyTorchClassifier):
             raise FileNotFoundError(msg)
 
         else:
-            checkpoint = torch.load(filepath)
+            checkpoint = torch.load(filepath, weights_only=False)
         self.model.load_state_dict(checkpoint["state_dict"])
         self.model.to(self.device)
 
@@ -350,7 +350,7 @@ class PyTorchClassifierWrapper(ArtPyTorchClassifier):
             raise FileNotFoundError(msg)
 
         else:
-            self._model._model = torch.load(filepath, map_location=self.device)
+            self._model._model = torch.load(filepath, map_location=self.device, weights_only=False)
             self.model.to(self.device)
             self.model.eval()
 

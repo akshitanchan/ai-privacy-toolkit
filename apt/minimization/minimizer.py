@@ -7,7 +7,6 @@ from collections import Counter
 import pandas as pd
 import numpy as np
 import copy
-import sys
 from scipy.spatial import distance
 from sklearn.base import BaseEstimator, TransformerMixin, MetaEstimatorMixin
 from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder
@@ -15,6 +14,13 @@ from sklearn.utils.validation import check_is_fitted
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 from sklearn.model_selection import train_test_split
 
+from apt.minimization.security_metrics import compute_sensitive_auc, measure_attribute_disclosure
+from apt.minimization.security_postprocess import (
+    enforce_cell_privacy,
+    randomize_cell_representatives,
+)
+from apt.minimization.security_metrics import compute_pa_ilag_score
+from apt.minimization.weighted_ncp import compute_sensitivity_weights
 from apt.utils.datasets import ArrayDataset, DATA_PANDAS_NUMPY_TYPE
 from apt.utils.models import Model, SklearnRegressor, SklearnClassifier, \
     CLASSIFIER_SINGLE_OUTPUT_CLASS_PROBABILITIES
@@ -76,6 +82,17 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                                        False indicates that the `generalizations` structure should be used.
                                        Default is True.
     :type generalize_using_transform: boolean, optional
+    :param dp_config: Optional randomized-representative configuration.
+    :type dp_config: dict, optional
+    :param disclosure_config: Optional attribute disclosure metric configuration.
+    :type disclosure_config: dict, optional
+    :param diversity_config: Optional cell diversity constraints configuration.
+        Keys: ``sensitive_features``, ``k_min``, ``l_min``, ``t_threshold`` (default 0.3).
+    :type diversity_config: dict, optional
+    :param pa_ilag_config: Optional privacy-augmented ILAG configuration.
+    :type pa_ilag_config: dict, optional
+    :param security_verbose: Whether to print security report messages during fit.
+    :type security_verbose: bool, optional
     """
 
     def __init__(self, estimator: Union[BaseEstimator, Model] = None,
@@ -87,7 +104,13 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                  feature_slices: Optional[list] = None,
                  train_only_features_to_minimize: Optional[bool] = True,
                  is_regression: Optional[bool] = False,
-                 generalize_using_transform: bool = True):
+                 generalize_using_transform: bool = True,
+                 dp_config: Optional[dict] = None,
+                 disclosure_config: Optional[dict] = None,
+                 diversity_config: Optional[dict] = None,
+                 pa_ilag_config: Optional[dict] = None,
+                 weighted_ncp_config: Optional[dict] = None,
+                 security_verbose: bool = False):
 
         self.estimator = estimator
         if estimator is not None and not issubclass(estimator.__class__, Model):
@@ -113,8 +136,17 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         self.is_regression = is_regression
         self.encoder = encoder
         self.generalize_using_transform = generalize_using_transform
+        self.dp_config = dp_config
+        self.disclosure_config = disclosure_config
+        self.diversity_config = diversity_config
+        self.pa_ilag_config = pa_ilag_config
+        self.weighted_ncp_config = weighted_ncp_config
+        self.security_verbose = security_verbose
         self._ncp_scores = NCPScores()
+        self._security_report = None
+        self._use_cell_contains_mapping = False
         self._feature_data = None
+        self._feature_weights = None  # set in fit() if weighted_ncp_config is provided
         self._categorical_values = {}
         self._dt = None
         self._features = None
@@ -140,6 +172,12 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         ret['is_regression'] = self.is_regression
         ret['estimator'] = self.estimator
         ret['encoder'] = self.encoder
+        ret['dp_config'] = self.dp_config
+        ret['disclosure_config'] = self.disclosure_config
+        ret['diversity_config'] = self.diversity_config
+        ret['pa_ilag_config'] = self.pa_ilag_config
+        ret['weighted_ncp_config'] = self.weighted_ncp_config
+        ret['security_verbose'] = self.security_verbose
         if deep:
             ret['cells'] = copy.deepcopy(self.cells)
         else:
@@ -178,6 +216,18 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             self.estimator = params['estimator']
         if 'encoder' in params:
             self.encoder = params['encoder']
+        if 'dp_config' in params:
+            self.dp_config = params['dp_config']
+        if 'disclosure_config' in params:
+            self.disclosure_config = params['disclosure_config']
+        if 'diversity_config' in params:
+            self.diversity_config = params['diversity_config']
+        if 'pa_ilag_config' in params:
+            self.pa_ilag_config = params['pa_ilag_config']
+        if 'weighted_ncp_config' in params:
+            self.weighted_ncp_config = params['weighted_ncp_config']
+        if 'security_verbose' in params:
+            self.security_verbose = params['security_verbose']
         return self
 
     @property
@@ -201,6 +251,17 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         transform call, and a score based on global generalizations.
         """
         return self._ncp_scores
+
+    @property
+    def security_report(self):
+        """Security findings from the most recent fit() call.
+
+        Returns a dict with up to four keys - 'disclosure', 'diversity',
+        'randomized_representatives', and 'pa_ilag' - populated according to
+        which security configs were passed at construction. Returns None if fit()
+        has not been called yet or no security features were configured.
+        """
+        return self._security_report
 
     def fit_transform(self, X: Optional[DATA_PANDAS_NUMPY_TYPE] = None, y: Optional[DATA_PANDAS_NUMPY_TYPE] = None,
                       features_names: Optional[list] = None, dataset: Optional[ArrayDataset] = None):
@@ -267,6 +328,8 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         else:
             self._features = None
 
+        self._reset_security_runtime()
+
         # Going to fit
         # (currently not dealing with option to fit with only X and y and no estimator)
         if self.estimator and dataset and dataset.get_samples() is not None and dataset.get_labels() is not None:
@@ -311,8 +374,23 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                 used_x_train = x_train_qi
                 used_x_test = x_test_qi
 
+            sensitive_feature = None
+            for _cfg in [self.disclosure_config, self.pa_ilag_config, self.diversity_config]:
+                if _cfg is not None:
+                    sensitive_feature = _cfg.get('sensitive_feature') or (_cfg.get('sensitive_features', [None]) or [None])[0]
+                    if sensitive_feature:
+                        break
+
             # collect feature data (such as min, max)
             self._feature_data = self._get_feature_data(x)
+
+            # compute sensitivity weights once, falling back to uniform weights when not configured
+            if self.weighted_ncp_config:
+                self._feature_weights = compute_sensitivity_weights(
+                    self._features,
+                    sensitive_features=self.weighted_ncp_config.get('sensitive_features', []),
+                    alpha=self.weighted_ncp_config.get('alpha', 2.0),
+                )
 
             self.cells = []
             self._categorical_values = {}
@@ -396,6 +474,80 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
 
             # self._cells currently holds the chosen generalization based on target accuracy
 
+            # collapse pa-ilag per-step data into summary lists for the report
+            if self.pa_ilag_config and self._security_report.get('pa_ilag'):
+                pa_steps = self._security_report['pa_ilag'].get('steps', [])
+                self._security_report['pa_ilag']['feature_removal_order'] = [
+                    s['selected_feature'] for s in pa_steps
+                ]
+                self._security_report['pa_ilag']['baseline_removal_order'] = [
+                    s.get('baseline_feature') for s in pa_steps
+                ]
+                self._security_report['pa_ilag']['num_divergence_steps'] = sum(
+                    1 for s in pa_steps if s.get('diverged')
+                )
+
+            if self.weighted_ncp_config and self.security_verbose:
+                print('Weighted NCP: alpha=%s, sensitive=%s' % (
+                    self.weighted_ncp_config.get('alpha', 2.0),
+                    self.weighted_ncp_config.get('sensitive_features', []),
+                ))
+
+            nodes = self._get_nodes_level(self._level)
+            if self.diversity_config:
+                div_sens = self.diversity_config.get('sensitive_features') or (
+                    [sensitive_feature] if sensitive_feature else [])
+                self.cells, diversity_report = enforce_cell_privacy(
+                    self.cells, x_train, self._features,
+                    sensitive_features=div_sens,
+                    k_min=self.diversity_config.get('k_min', 5),
+                    l_min=self.diversity_config.get('l_min', 2),
+                    t_threshold=self.diversity_config.get('t_threshold', 0.3),
+                    max_iterations=self.diversity_config.get('max_merge_iterations', 100),
+                )
+                self._security_report['diversity'] = diversity_report
+                self._cells_by_id = {cell['id']: cell for cell in self.cells}
+                if diversity_report.get('num_merges', 0) > 0:
+                    self._use_cell_contains_mapping = True
+
+            if self.dp_config:
+                dp_report = randomize_cell_representatives(
+                    self.cells,
+                    x_train,
+                    self._features,
+                    feature_data=self._feature_data,
+                    epsilon=self.dp_config.get('epsilon', 1.0),
+                    max_retries=self.dp_config.get('max_retries', 10),
+                    random_state=self.dp_config.get('seed', self.dp_config.get('random_state', 42)),
+                )
+                self._security_report['randomized_representatives'] = dp_report
+                if self.security_verbose:
+                    print('DP representatives: %s' % dp_report)
+
+            # measure attribute disclosure on the final generalization
+            generalized = self._generalize(x_test, x_prepared_test, nodes)
+            _can_disclose = (not self.is_regression and sensitive_feature
+                             and sensitive_feature in x_test.columns
+                             and (self.disclosure_config or self.pa_ilag_config))
+            if _can_disclose:
+                disclosure_report = measure_attribute_disclosure(
+                    x_test,
+                    generalized,
+                    sensitive_feature=sensitive_feature,
+                    auc_threshold=(self.disclosure_config or {}).get('auc_threshold', 0.7),
+                    test_size=(self.disclosure_config or {}).get('test_size', 0.3),
+                    random_state=(self.disclosure_config or {}).get('seed',
+                                 (self.disclosure_config or {}).get('random_state', 42)),
+                )
+                self._security_report['disclosure'] = disclosure_report
+                if self.security_verbose:
+                    print('Attribute disclosure: %s' % disclosure_report)
+                if not disclosure_report.get('threshold_pass', True):
+                    print('WARNING: attribute-disclosure AUC %.4f exceeds threshold %.4f for '
+                          'sensitive feature "%s". Generalized data still leaks this attribute.'
+                          % (disclosure_report['auc_after'], disclosure_report['auc_threshold'],
+                             disclosure_report['sensitive_feature']))
+
             # calculate iLoss
             x_test_dataset = ArrayDataset(x_test, features_names=self._features)
             self._ncp_scores.fit_score = self.calculate_ncp(x_test_dataset)
@@ -472,15 +624,25 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                     range_counts[feature] = [count]
                 for feature in cell['categories']:
                     category_counts[feature] = [count]
-                ncp += self._calc_ncp_for_generalization(generalizations[cell['id']], range_counts, category_counts,
-                                                         total_samples)
+                ncp += self._calc_ncp_for_generalization(generalizations[cell['id']], range_counts, category_counts, total_samples, feature_weights=self._feature_weights)
         else:  # use generalizations
             generalizations = self.generalizations
             range_counts = self._find_range_counts(samples_pd, generalizations['ranges'])
             category_counts = self._find_category_counts(samples_pd, generalizations['categories'])
-            ncp = self._calc_ncp_for_generalization(generalizations, range_counts, category_counts, total_samples)
+            ncp = self._calc_ncp_for_generalization(generalizations, range_counts, category_counts, total_samples, feature_weights=self._feature_weights)
 
         return ncp
+
+    # clear all mutable security state so a second fit() call starts clean
+    def _reset_security_runtime(self):
+        self._use_cell_contains_mapping = False
+        self._feature_weights = None
+        self._security_report = {
+            'disclosure': None,
+            'diversity': None,
+            'randomized_representatives': None,
+            'pa_ilag': {'steps': []},
+        }
 
     def _inner_transform(self, x: Optional[DATA_PANDAS_NUMPY_TYPE] = None, features_names: Optional[list] = None,
                          dataset: Optional[ArrayDataset] = None):
@@ -510,7 +672,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         if not self._features:
             self._features = [i for i in range(x_pd.shape[1])]
 
-        if self._dt:  # only works if fit was called previously (but much more efficient)
+        if self._dt and not self._use_cell_contains_mapping:  # default fast path when tree mapping is valid
             nodes = self._get_nodes_level(self._level)
             QI = x_pd.loc[:, self.features_to_minimize]
             used_x = x_pd
@@ -519,12 +681,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             prepared = self._encode_categorical_features(used_x)
             generalized = self._generalize_from_tree(x_pd, prepared, nodes, self.cells, self._cells_by_id)
         else:
-            mapped = np.zeros(x_pd.shape[0])  # to mark records we already mapped
-            all_indexes = []
-            for cell in self.cells:
-                indexes = self._get_record_indexes_for_cell(x_pd, cell, mapped)
-                all_indexes.append(indexes)
-            generalized = self._generalize_indexes(x_pd, self.cells, all_indexes)
+            generalized = self._generalize_by_cell_contains(x_pd)
 
         if dataset and dataset.is_pandas:
             return generalized
@@ -532,27 +689,48 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             return generalized
         return generalized.to_numpy()
 
-    def _calc_ncp_for_generalization(self, generalization, range_counts, category_counts, total_count):
-        total_ncp = 0
-        total_features = len(generalization['untouched'])
+    def _calc_ncp_for_generalization(self, generalization, range_counts, category_counts, total_count, feature_weights=None):
         ranges = generalization['ranges']
         categories = generalization['categories']
 
-        # suppressed features are already taken care of within _calc_ncp_numeric
-        for feature in ranges.keys():
-            feature_ncp = self._calc_ncp_numeric(ranges[feature], range_counts[feature],
-                                                 self._feature_data[feature], total_count)
-            total_ncp = total_ncp + feature_ncp
-            total_features += 1
-        for feature in categories.keys():
-            feature_ncp = self._calc_ncp_categorical(categories[feature], category_counts[feature],
-                                                     self._feature_data[feature],
-                                                     total_count)
-            total_ncp = total_ncp + feature_ncp
-            total_features += 1
-        if total_features == 0:
-            return 0
-        return total_ncp / total_features
+        if feature_weights is None:
+            # original uniform-average path, no behavioral change
+            total_ncp = 0
+            total_features = len(generalization['untouched'])
+            for feature in ranges.keys():
+                feature_ncp = self._calc_ncp_numeric(ranges[feature], range_counts[feature],
+                                                     self._feature_data[feature], total_count)
+                total_ncp = total_ncp + feature_ncp
+                total_features += 1
+            for feature in categories.keys():
+                feature_ncp = self._calc_ncp_categorical(categories[feature], category_counts[feature],
+                                                         self._feature_data[feature],
+                                                         total_count)
+                total_ncp = total_ncp + feature_ncp
+                total_features += 1
+            if total_features == 0:
+                return 0
+            return total_ncp / total_features
+        else:
+            # weighted path: Σ(w_i * ncp_i) / Σ(w_i), untouched features add to denominator only
+            total_ncp = 0.0
+            sum_weights = sum(feature_weights.get(f, 1.0) for f in generalization['untouched'])
+            for feature in ranges.keys():
+                w = feature_weights.get(feature, 1.0)
+                feature_ncp = self._calc_ncp_numeric(ranges[feature], range_counts[feature],
+                                                     self._feature_data[feature], total_count)
+                total_ncp += w * feature_ncp
+                sum_weights += w
+            for feature in categories.keys():
+                w = feature_weights.get(feature, 1.0)
+                feature_ncp = self._calc_ncp_categorical(categories[feature], category_counts[feature],
+                                                         self._feature_data[feature],
+                                                         total_count)
+                total_ncp += w * feature_ncp
+                sum_weights += w
+            if sum_weights == 0:
+                return 0
+            return total_ncp / sum_weights
 
     @staticmethod
     def _calc_ncp_categorical(categories, category_count, feature_data, total):
@@ -591,8 +769,8 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
 
     def _get_record_indexes_for_cell(self, x, cell, mapped):
         indexes = []
-        for index, row in x.iterrows():
-            if not mapped.item(index) and self._cell_contains(cell, row, index, mapped):
+        for position, (index, row) in enumerate(x.iterrows()):
+            if not mapped.item(position) and self._cell_contains(cell, row, position, mapped):
                 indexes.append(index)
         return indexes
 
@@ -655,10 +833,10 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         # convert row to ndarray to allow indexing
         a = np.array(row)
         value = a.item(index)
-        if range['start']:
+        if range['start'] is not None:
             if value <= range['start']:
                 return False
-        if range['end']:
+        if range['end'] is not None:
             if value > range['end']:
                 return False
         return True
@@ -917,13 +1095,21 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         return original_data_generalized
 
     def _generalize_from_tree(self, original_data, prepared_data, level_nodes, cells, cells_by_id):
-        mapping_to_cells = self._map_to_cells(prepared_data, level_nodes, cells_by_id)
+        mapping_to_cells = self._map_to_cells(prepared_data, level_nodes, cells_by_id, original_data)
         all_indexes = []
         for i in range(len(cells)):
             # get the indexes of all records that map to this cell
             indexes = [j for j in mapping_to_cells if mapping_to_cells[j]['id'] == cells[i]['id']]
             all_indexes.append(indexes)
         return self._generalize_indexes(original_data, cells, all_indexes)
+
+    def _generalize_by_cell_contains(self, original_data):
+        mapped = np.zeros(original_data.shape[0])  # to mark records we already mapped
+        all_indexes = []
+        for cell in self.cells:
+            indexes = self._get_record_indexes_for_cell(original_data, cell, mapped)
+            all_indexes.append(indexes)
+        return self._generalize_indexes(original_data, self.cells, all_indexes)
 
     def _generalize_indexes(self, original_data, cells, all_indexes):
         # prepared data include one hot encoded categorical data + QI
@@ -968,8 +1154,11 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
     def _generalize(self, data, data_prepared, nodes):
         self._calculate_generalizations(data)
         if self.generalize_using_transform:
-            generalized = self._generalize_from_tree(data, data_prepared, nodes, self.cells,
-                                                     self._cells_by_id)
+            if self._use_cell_contains_mapping:
+                generalized = self._generalize_by_cell_contains(data)
+            else:
+                generalized = self._generalize_from_tree(data, data_prepared, nodes, self.cells,
+                                                         self._cells_by_id)
         else:
             generalized = self._generalize_from_generalizations(data, self.generalizations)
         return generalized
@@ -997,11 +1186,21 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             all_sample_indexes.append(sample_indexes)
         return all_sample_indexes
 
-    def _map_to_cells(self, samples, nodes, cells_by_id):
+    def _map_to_cells(self, samples, nodes, cells_by_id, original_samples=None):
         mapping_to_cells = {}
-        for index, row in samples.iterrows():
-            cell = self._find_sample_cells([row], nodes, cells_by_id)[0]
-            mapping_to_cells[index] = cell
+        if self._use_cell_contains_mapping:
+            if original_samples is None:
+                original_samples = samples
+            mapped = np.zeros(original_samples.shape[0])
+            for position, (index, row) in enumerate(original_samples.iterrows()):
+                for cell in self.cells:
+                    if not mapped.item(position) and self._cell_contains(cell, row, position, mapped):
+                        mapping_to_cells[index] = cell
+                        break
+        else:
+            for index, row in samples.iterrows():
+                cell = self._find_sample_cells([row], nodes, cells_by_id)[0]
+                mapping_to_cells[index] = cell
         return mapping_to_cells
 
     def _find_sample_cells(self, samples, nodes, cells_by_id):
@@ -1028,10 +1227,27 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         ranges = self._generalizations['ranges']
         range_counts = self._find_range_counts(original_data, ranges)
         total = prepared_data.size
-        range_min = sys.float_info.max
-        remove_feature = None
+        feature_scores = {}
+        # plain ilag scores without the leakage penalty, used to detect divergence
+        base_ilag_scores = {}
+        step_details = {}
         categories = self.generalizations['categories']
         category_counts = self._find_category_counts(original_data, categories)
+        sensitive_feature = None
+        for _cfg in [self.disclosure_config, self.pa_ilag_config, self.diversity_config]:
+            if _cfg is not None:
+                sensitive_feature = _cfg.get('sensitive_feature') or (_cfg.get('sensitive_features', [None]) or [None])[0]
+                if sensitive_feature:
+                    break
+        pa_ilag_enabled = (not self.is_regression and sensitive_feature
+                           and sensitive_feature in original_data.columns
+                           and self.pa_ilag_config is not None)
+        current_auc = None
+        if pa_ilag_enabled:
+            current_generalized = self._generalize_from_tree(original_data, prepared_data, nodes, self.cells,
+                                                             self._cells_by_id)
+            current_auc = compute_sensitive_auc(current_generalized, sensitive_feature=sensitive_feature)
+        lambda_attr = self.pa_ilag_config.get('lambda_attr', 1.0) if self.pa_ilag_config else 1.0
 
         for feature in ranges.keys():
             if feature not in self._generalizations['untouched']:
@@ -1042,13 +1258,24 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                                                          range_counts[feature],
                                                          feature_data[feature],
                                                          total)
+                # scale ncp by sensitivity weight before ilag normalization
+                if self._feature_weights:
+                    feature_ncp *= self._feature_weights.get(feature, 1.0)
                 if feature_ncp > 0:
-                    feature_ncp = self._normalize_ncp_by_accuracy_gain(original_data, prepared_data, nodes, feature,
-                                                                       feature_ncp, labels, current_accuracy)
-
-                if feature_ncp < range_min:
-                    range_min = feature_ncp
-                    remove_feature = feature
+                    base_ilag, _, candidate_generalized = self._evaluate_feature_removal(original_data, prepared_data, nodes, feature, feature_ncp, labels, current_accuracy)
+                else:
+                    base_ilag = feature_ncp
+                    candidate_generalized = None
+                base_ilag_scores[feature] = base_ilag  # plain ILAG score (no leakage penalty)
+                score = base_ilag
+                leakage_delta = 0.0
+                candidate_auc = None
+                if pa_ilag_enabled and candidate_generalized is not None:
+                    candidate_auc = compute_sensitive_auc(candidate_generalized, sensitive_feature=sensitive_feature)
+                    leakage_delta = max(0.0, candidate_auc - current_auc)
+                    score = compute_pa_ilag_score(base_ilag, leakage_delta, lambda_attr=lambda_attr)
+                feature_scores[feature] = score
+                step_details[feature] = {'base_ilag': base_ilag, 'score': score, 'candidate_auc': candidate_auc, 'current_auc': current_auc, 'leakage_delta': leakage_delta}
 
         for feature in categories.keys():
             if feature not in self.generalizations['untouched']:
@@ -1059,14 +1286,51 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                                                              category_counts[feature],
                                                              feature_data[feature],
                                                              total)
+                if self._feature_weights:
+                    feature_ncp *= self._feature_weights.get(feature, 1.0)
                 if feature_ncp > 0:
-                    feature_ncp = self._normalize_ncp_by_accuracy_gain(original_data, prepared_data, nodes, feature,
-                                                                       feature_ncp, labels, current_accuracy)
+                    base_ilag, _, candidate_generalized = self._evaluate_feature_removal(original_data, prepared_data, nodes, feature, feature_ncp, labels, current_accuracy)
+                else:
+                    base_ilag = feature_ncp
+                    candidate_generalized = None
+                base_ilag_scores[feature] = base_ilag
+                score = base_ilag
+                leakage_delta = 0.0
+                candidate_auc = None
+                if pa_ilag_enabled and candidate_generalized is not None:
+                    candidate_auc = compute_sensitive_auc(candidate_generalized, sensitive_feature=sensitive_feature)
+                    leakage_delta = max(0.0, candidate_auc - current_auc)
+                    score = compute_pa_ilag_score(base_ilag, leakage_delta, lambda_attr=lambda_attr)
+                feature_scores[feature] = score
+                step_details[feature] = {'base_ilag': base_ilag, 'score': score, 'candidate_auc': candidate_auc,
+                                         'current_auc': current_auc, 'leakage_delta': leakage_delta}
 
-                if feature_ncp < range_min:
-                    range_min = feature_ncp
-                    remove_feature = feature
-
+        remove_feature = min(feature_scores, key=feature_scores.get) if feature_scores else None
+        if pa_ilag_enabled:
+            # Recover raw (unweighted) ILAG scores by dividing out sensitivity weights
+            # base_ilag_scores already have weights baked in - dividing removes them so that
+            # baseline_removal_order reflects what plain ILAG (no Feature 1, no Feature 2)
+            # would have selected - num_divergence_steps then captures the combined effect of
+            # weighted NCP and the leakage penalty, not just the leakage penalty alone
+            _raw_ilag_scores = {}
+            for _f, _wilag in base_ilag_scores.items():
+                _w = (self._feature_weights.get(_f, 1.0) if self._feature_weights else 1.0)
+                _raw_ilag_scores[_f] = _wilag / _w if _w != 0 else _wilag
+            # Backfill raw_ilag into step_details so tests can verify the computation
+            for _f in step_details:
+                step_details[_f]['raw_ilag'] = _raw_ilag_scores.get(_f)
+            baseline_feature = min(_raw_ilag_scores, key=_raw_ilag_scores.get) if _raw_ilag_scores else None
+            pa_ilag_report = self._security_report.get('pa_ilag', {})
+            steps = pa_ilag_report.get('steps', [])
+            steps.append({
+                'selected_feature': remove_feature,
+                'baseline_feature': baseline_feature,
+                'diverged': baseline_feature != remove_feature,
+                'lambda_attr': float(lambda_attr),
+                'scores': step_details,
+            })
+            pa_ilag_report['steps'] = steps
+            self._security_report['pa_ilag'] = pa_ilag_report
         print('feature to remove: ' + (str(remove_feature) if remove_feature is not None else 'none'))
         return remove_feature
 
@@ -1080,20 +1344,19 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             generalizations = self._calculate_generalizations_for_cell(cell)
             cell_ncp = 0
             if feature in cell['ranges']:
-                cell_ncp = self._calc_ncp_numeric(generalizations['ranges'][feature],
-                                                  [count],
-                                                  feature_data[feature],
-                                                  total)
+                if feature in generalizations['ranges']:
+                    cell_ncp = self._calc_ncp_numeric(generalizations['ranges'][feature], [count], feature_data[feature], total)
             elif feature in cell['categories']:
-                cell_ncp = self._calc_ncp_categorical(generalizations['categories'][feature],
-                                                      [count],
-                                                      feature_data[feature],
-                                                      total)
+                if feature in generalizations['categories']:
+                    cell_ncp = self._calc_ncp_categorical(generalizations['categories'][feature], [count], feature_data[feature], total)
             feature_ncp += cell_ncp
         return feature_ncp
 
-    def _normalize_ncp_by_accuracy_gain(self, original_data, prepared_data, nodes, feature, feature_ncp, labels,
-                                        current_accuracy):
+    def _normalize_ncp_by_accuracy_gain(self, original_data, prepared_data, nodes, feature, feature_ncp, labels, current_accuracy):
+        normalized_ncp, _, _ = self._evaluate_feature_removal(original_data, prepared_data, nodes, feature, feature_ncp, labels, current_accuracy)
+        return normalized_ncp
+
+    def _evaluate_feature_removal(self, original_data, prepared_data, nodes, feature, feature_ncp, labels, current_accuracy):
         new_cells = copy.deepcopy(self.cells)
         cells_by_id = copy.deepcopy(self._cells_by_id)
         self._remove_feature_from_cells(new_cells, cells_by_id, feature)
@@ -1105,7 +1368,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             accuracy_gain = 0
         if accuracy_gain != 0:
             feature_ncp = feature_ncp / accuracy_gain
-        return feature_ncp
+        return feature_ncp, accuracy, generalized
 
     def _calculate_generalizations(self, samples: Optional[pd.DataFrame] = None):
         ranges, range_representatives = self._calculate_ranges(self.cells)
