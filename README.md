@@ -1,5 +1,7 @@
 [![OpenSSF Best Practices](https://bestpractices.coreinfrastructure.org/projects/5836/badge)](https://bestpractices.coreinfrastructure.org/projects/5836)
 
+# AI Privacy Toolkit
+
 Goldsteen et al. [1] introduced a method to minimise the personal data an ML model needs at inference time: generalise input features until accuracy just starts to drop, guided by an NCP-over-accuracy-gain score (ILAG). The method works well, but the paper flags security gaps it leaves open. This fork closes four of them, including a novel closed feedback loop (PA-ILAG).
 
 ## Features Introduced
@@ -27,7 +29,7 @@ Cell representatives in the original method are real training records, which cre
 
 ## Implementation
 
-All four features integrate into the existing `fit()` pipeline in `apt/minimization/minimizer.py`. Additionally, unit tests (`tests/test_minimizer_security.py`) and a Jupyter notebook (`notebooks/minimization_security_extension.ipynb`) are included.
+All four features integrate into the existing `fit()` pipeline in `apt/minimization/minimizer.py`. Additionally, unit tests and a Jupyter notebook (`notebooks/minimization_security_extension.ipynb`) are included.
 
 ### How `fit()` ties it together
 
