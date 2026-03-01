@@ -1266,7 +1266,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                 else:
                     base_ilag = feature_ncp
                     candidate_generalized = None
-                base_ilag_scores[feature] = base_ilag  # plain ILAG score (no leakage penalty)
+                base_ilag_scores[feature] = base_ilag
                 score = base_ilag
                 leakage_delta = 0.0
                 candidate_auc = None
@@ -1316,7 +1316,6 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             for _f, _wilag in base_ilag_scores.items():
                 _w = (self._feature_weights.get(_f, 1.0) if self._feature_weights else 1.0)
                 _raw_ilag_scores[_f] = _wilag / _w if _w != 0 else _wilag
-            # Backfill raw_ilag into step_details so tests can verify the computation
             for _f in step_details:
                 step_details[_f]['raw_ilag'] = _raw_ilag_scores.get(_f)
             baseline_feature = min(_raw_ilag_scores, key=_raw_ilag_scores.get) if _raw_ilag_scores else None

@@ -306,7 +306,6 @@ def _is_non_verbatim(candidate, data):
 def _sample_representative(cell, feature_data, epsilon, rng):
     rep = cell.get('representative') or {}
     result = {}
-    # Laplace noise scaled by cell_range / epsilon for numeric features
     for feature, bounds in cell.get('ranges', {}).items():
         lo = bounds.get('start') if bounds.get('start') is not None else feature_data[feature]['min']
         hi = bounds.get('end') if bounds.get('end') is not None else feature_data[feature]['max']
@@ -314,7 +313,6 @@ def _sample_representative(cell, feature_data, epsilon, rng):
         noised = float(base) + rng.laplace(0.0, (float(hi) - float(lo)) / epsilon)
         clipped = float(np.clip(noised, lo, hi))
         result[feature] = int(round(clipped)) if isinstance(base, (int, np.integer)) else clipped
-    # Exponential mechanism for categorical features
     for feature, cats in cell.get('categories', {}).items():
         allowed = list(cats)
         base = rep.get(feature, allowed[0])
@@ -332,7 +330,6 @@ def _sample_representative(cell, feature_data, epsilon, rng):
 
 # Deterministically nudge a candidate point to guarantee it does not match any training row when sampling fails
 def _build_non_verbatim_fallback(cell, candidate, feature_data):
-    # Deterministic nudge by shifting the first numeric feature slightly
     result = copy.deepcopy(candidate)
     for feature, bounds in cell.get('ranges', {}).items():
         val = result.get(feature)

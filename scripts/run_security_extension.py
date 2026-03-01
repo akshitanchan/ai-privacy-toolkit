@@ -131,7 +131,6 @@ def run(dataset_name, target_accuracy, ablation=False):
     dp = rpt.get('randomized_representatives') or {}
     pa = rpt.get('pa_ilag') or {}
 
-    # Terminal output
     print('\n' + '=' * 64)
     print('  Security Extension Results  --  %s' % dataset_name)
     print('=' * 64)
