@@ -14,3 +14,6 @@ It is also possible to export the generalizations as feature ranges.
 
 """
 from apt.minimization.minimizer import GeneralizeToRepresentative
+from apt.minimization.security_metrics import compute_pa_ilag_score, measure_attribute_disclosure
+from apt.minimization.security_postprocess import enforce_cell_privacy, randomize_cell_representatives
+from apt.minimization.weighted_ncp import compute_sensitivity_weights
