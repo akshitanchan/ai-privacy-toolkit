@@ -103,11 +103,41 @@ Where each value inside the range list represents a cutoff point. For example, f
 this example are: ``<21.5, 21.5-39.0, 39.0-51.0, 51.0-70.5, >70.5``. The ``untouched`` list represents features that 
 were not generalized, i.e., their values should remain unchanged.
 
+Security Extension Options
+-----
+
+The minimizer includes optional security parameters (all default to ``None`` for full backward
+compatibility):
+
+- ``weighted_ncp_config``: sensitivity-weighted NCP (``sensitive_features``, ``alpha``).
+- ``pa_ilag_config``: privacy-augmented feature-removal scoring (``lambda_attr``, ``sensitive_feature``).
+- ``disclosure_config``: attribute disclosure AUC measurement (``sensitive_feature``, ``auc_threshold``).
+- ``diversity_config``: k/l diversity enforcement and t-closeness measurement (``k_min``, ``l_min``, ``t_threshold``, ``sensitive_features``).
+- ``dp_config``: DP-inspired representative randomization (``epsilon``, ``max_retries``, ``seed``).
+- ``security_verbose``: print security report during ``fit()``.
+
+Security Example
+-----
+
+```
+gen = GeneralizeToRepresentative(
+    estimator=base_est,
+    target_accuracy=0.98,
+    categorical_features=categorical_features,
+    encoder=preprocessor,
+    weighted_ncp_config={"sensitive_features": ["sex"], "alpha": 2.0},
+    dp_config={"epsilon": 1.0, "max_retries": 10, "seed": 42},
+    disclosure_config={"sensitive_feature": "sex", "auc_threshold": 0.70},
+    diversity_config={"sensitive_features": ["sex"], "k_min": 5, "l_min": 2, "t_threshold": 0.3},
+    pa_ilag_config={"lambda_attr": 1.0, "sensitive_feature": "sex"},
+    security_verbose=True,
+)
+gen.fit(dataset=train_dataset)
+transformed = gen.transform(dataset=test_dataset)
+print(gen.security_report)
+```
+
 Citation
---------
+-----
 Goldsteen, A., Ezov, G., Shmelkin, R. et al. Data minimization for GDPR compliance in machine learning models. AI Ethics 
 (2021). https://doi.org/10.1007/s43681-021-00095-8
-
-
-
-
